@@ -1572,7 +1572,7 @@ if test "$ipv6" = true; then
         #include <netinet/in.h>
       ]],
       [[
-        struct sockaddr_in6 s; struct in6_addr t=in6addr_any; int i=AF_INET6; s; t.s6_addr[0] = 0;
+        struct sockaddr_in6 s; struct in6_addr t=in6addr_any; int i=AF_INET6; (void)s; t.s6_addr[0] = 0; (void)t; (void)i;
       ]])],
       [ac_cv_ipv6_support=yes],
       [ac_cv_ipv6_support=no]
@@ -1691,6 +1691,7 @@ do_build="\
   mod_ssi \
   mod_staticfile \
   mod_status \
+  mod_union \
   mod_userdir \
   mod_vhostdb \
   mod_webdav \
