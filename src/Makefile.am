@@ -341,6 +341,11 @@ mod_wstunnel_la_SOURCES = mod_wstunnel.c
 mod_wstunnel_la_LDFLAGS = $(common_module_ldflags)
 mod_wstunnel_la_LIBADD = $(common_libadd) $(CRYPTO_LIB)
 
+lib_LTLIBRARIES += mod_union.la
+mod_union_la_SOURCES = mod_union.c
+mod_union_la_LDFLAGS = $(common_module_ldflags)
+mod_union_la_LIBADD = $(common_libadd)
+
 endif # !LIGHTTPD_STATIC
 
 
@@ -410,6 +415,7 @@ lighttpd_SOURCES = \
   mod_ssi.c \
   mod_staticfile.c \
   mod_status.c \
+  mod_union.c \
   mod_userdir.c \
   mod_vhostdb.c \
   mod_vhostdb_api.c \
