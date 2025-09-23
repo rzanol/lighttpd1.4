@@ -406,17 +406,28 @@ static void connection_free(connection * const con) {
 }
 
 void connections_pool_clear(server * const srv) {
+    connection *con, *next = srv->conns_pool;
+    srv->conns_pool = NULL;
+    while ((con = next)) {
+        next = con->next;
+        if (!con->jqnext) /*(jqnext or sentinel; NULL if not in job queue)*/
+            connection_free(con);
+        else {
+            /*(leave con in srv->conns_pool if con still in job queue
+             * rather than excess work to remove from singly-linked job queue
+             * for rare, but possible, condition; reverses list of remainders)*/
+            con->next = srv->conns_pool;
+            srv->conns_pool = con;
+        }
+    }
+}
+
+void connections_free(server *srv) {
     connection *con;
     while ((con = srv->conns_pool)) {
         srv->conns_pool = con->next;
         connection_free(con);
     }
-}
-
-void connections_free(server *srv) {
-    connections_pool_clear(srv);
-
-    connection *con;
     while ((con = srv->conns)) {
         srv->conns = con->next;
         connection_free(con);
@@ -516,6 +527,11 @@ static int connection_read_cq_err(connection *con) {
   #else
     switch (errno) {
     case EAGAIN:
+   #ifdef EWOULDBLOCK
+   #if EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+   #endif
+   #endif
         return 0;
     case EINTR:
         /* we have been interrupted before we could read */
@@ -679,6 +695,10 @@ connection_state_machine_loop (request_st * const r, connection * const con)
 		case CON_STATE_RESPONSE_END: /* transient */
 		case CON_STATE_ERROR:        /* transient */
 			connection_handle_response_end_state(r, con);
+			if (r->state == CON_STATE_REQUEST_START) {
+				joblist_append(con);
+				return;
+			}
 			/*(make sure ostate will not match r->state)*/
 			ostate = CON_STATE_RESPONSE_END;/* != r->state */
 			break;

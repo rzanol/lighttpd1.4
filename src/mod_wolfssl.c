@@ -59,12 +59,6 @@
 #include <wolfssl/ocsp.h>
 #endif
 
-static char global_err_buf[WOLFSSL_MAX_ERROR_SZ];
-#undef ERR_error_string
-#define ERR_error_string(e,b) \
-        (wolfSSL_ERR_error_string_n((e),global_err_buf,WOLFSSL_MAX_ERROR_SZ), \
-         global_err_buf)
-
 #if 0 /* symbols and definitions requires WolfSSL built with -DOPENSSL_EXTRA */
 #define SSL_TLSEXT_ERR_OK               0
 #define SSL_TLSEXT_ERR_ALERT_FATAL      alert_fatal
@@ -115,27 +109,38 @@ WOLFSSL_API WOLFSSL_X509_NAME_ENTRY *wolfSSL_X509_NAME_get_entry(WOLFSSL_X509_NA
 #include "log.h"
 #include "plugin.h"
 
-typedef struct {
-    /* SNI per host: with COMP_SERVER_SOCKET, COMP_HTTP_SCHEME, COMP_HTTP_HOST */
+typedef struct mod_wolfssl_kp {
     buffer *ssl_pemfile_pkey;
     buffer *ssl_pemfile_x509;
     buffer **ssl_pemfile_chain;
-    buffer *ssl_stapling;
+    buffer *ssl_stapling_der;
+    int refcnt;
+    int8_t must_staple;
+    unix_time64_t ssl_stapling_loadts;
+    unix_time64_t ssl_stapling_nextts;
+    struct mod_wolfssl_kp *next;
+} mod_wolfssl_kp;
+
+typedef struct {
+    /* SNI per host: with COMP_SERVER_SOCKET, COMP_HTTP_SCHEME, COMP_HTTP_HOST */
+    mod_wolfssl_kp *kp; /* parsed public/private key structures */
     const buffer *ssl_pemfile;
     const buffer *ssl_privkey;
     const buffer *ssl_stapling_file;
-    unix_time64_t ssl_stapling_loadts;
-    unix_time64_t ssl_stapling_nextts;
-    char must_staple;
+    unix_time64_t pkey_ts;
 } plugin_cert;
 
 typedef struct {
     WOLFSSL_CTX *ssl_ctx;
+    plugin_cert *pc;
+    mod_wolfssl_kp *kp;
 } plugin_ssl_ctx;
 
 typedef struct {
     STACK_OF(X509_NAME) *names;
-    X509_STORE *certs;
+    X509_STORE *store;
+    const char *crl_file;
+    unix_time64_t crl_loadts;
 } plugin_cacerts;
 
 typedef struct {
@@ -148,7 +153,7 @@ typedef struct {
     array *ssl_conf_cmd;
 
     /*(copied from plugin_data for socket ssl_ctx config)*/
-    const plugin_cert *pc;
+    plugin_cert *pc;
     const plugin_cacerts *ssl_ca_file;
     STACK_OF(X509_NAME) *ssl_ca_dn_file;
     const buffer *ssl_ca_crl_file;
@@ -177,10 +182,12 @@ typedef struct {
 
 typedef struct {
     PLUGIN_DATA;
-    plugin_ssl_ctx *ssl_ctxs;
+    plugin_ssl_ctx **ssl_ctxs;
     plugin_config defaults;
     server *srv;
+  #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
     array *cafiles;
+  #endif
     const char *ssl_stek_file;
 } plugin_data;
 
@@ -190,6 +197,8 @@ static int ssl_is_init;
 static plugin_data *plugin_data_singleton;
 #define LOCAL_SEND_BUFSIZE (16 * 1024)
 static char *local_send_buffer;
+static int feature_refresh_certs;
+static int feature_refresh_crls;
 
 typedef struct {
     WOLFSSL *ssl;
@@ -199,9 +208,57 @@ typedef struct {
     short close_notify;
     unsigned short alpn;
     plugin_config conf;
-    buffer *tmp_buf;
     log_error_st *errh;
+    mod_wolfssl_kp *kp;
+    plugin_cert *ssl_ctx_pc;
 } handler_ctx;
+
+
+__attribute_cold__
+static mod_wolfssl_kp *
+mod_wolfssl_kp_init (void)
+{
+    mod_wolfssl_kp * const kp = ck_calloc(1, sizeof(*kp));
+    kp->refcnt = 1;
+    return kp;
+}
+
+
+__attribute_cold__
+static void
+mod_wolfssl_kp_free (mod_wolfssl_kp *kp)
+{
+    if (kp->ssl_pemfile_pkey) {
+        wolfSSL_OPENSSL_cleanse(kp->ssl_pemfile_pkey->ptr,
+                                kp->ssl_pemfile_pkey->size);
+        buffer_free(kp->ssl_pemfile_pkey);
+    }
+    /*buffer_free(kp->ssl_pemfile_x509);*//*(part of chain)*/
+    if (kp->ssl_pemfile_chain) {
+        wolfSSL_OPENSSL_cleanse(kp->ssl_pemfile_chain[0]->ptr,
+                                kp->ssl_pemfile_chain[0]->size);
+        buffer_free(kp->ssl_pemfile_chain[0]);
+        free(kp->ssl_pemfile_chain);
+    }
+    buffer_free(kp->ssl_stapling_der);
+    free(kp);
+}
+
+
+static mod_wolfssl_kp *
+mod_wolfssl_kp_acq (plugin_cert *pc)
+{
+    mod_wolfssl_kp *kp = pc->kp;
+    ++kp->refcnt;
+    return kp;
+}
+
+
+static void
+mod_wolfssl_kp_rel (mod_wolfssl_kp *kp)
+{
+    --kp->refcnt;
+}
 
 
 static handler_ctx *
@@ -215,7 +272,73 @@ static void
 handler_ctx_free (handler_ctx *hctx)
 {
     if (hctx->ssl) SSL_free(hctx->ssl);
+    if (hctx->kp)
+        mod_wolfssl_kp_rel(hctx->kp);
     free(hctx);
+}
+
+
+__attribute_cold__
+__attribute_noinline__
+static void
+elog (log_error_st * const errh, const char * const file, const int line,
+      const char * const msg)
+{
+    /* error logging convenience function which decodes err codes */
+    char buf[WOLFSSL_MAX_ERROR_SZ];
+    wolfSSL_ERR_error_string_n(ERR_get_error(),buf,sizeof(buf));/*thread-safe*/
+    log_error(errh, file, line, "SSL: %s %s", msg, buf);
+}
+
+
+__attribute_cold__
+__attribute_format__((__printf__, 4, 5))
+__attribute_noinline__
+static void
+elogf (log_error_st * const errh, const char * const file, const int line,
+       const char * const fmt, ...)
+{
+    char msg[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+    elog(errh, file, line, msg);
+}
+
+
+__attribute_cold__
+__attribute_noinline__
+static void
+elogc (handler_ctx * const hctx,
+       const char * const file, const int line, const int ssl_err)
+{
+    char buf[WOLFSSL_MAX_ERROR_SZ];
+    uint32_t err;
+    while ((err = ERR_get_error())) {
+        switch (ERR_GET_REASON(err)) {
+          case SSL_R_SSL_HANDSHAKE_FAILURE:
+        #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
+          case SSL_R_UNEXPECTED_EOF_WHILE_READING:
+        #endif
+        #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
+          case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
+          case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
+        #endif
+        #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
+          case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
+        #endif
+            if (!hctx->conf.ssl_log_noise) continue;
+            break;
+          default:
+            break;
+        }
+        wolfSSL_ERR_error_string_n(err, buf, sizeof(buf)); /*(thread-safe)*/
+        log_error(hctx->r->conf.errh, file, line, "SSL: addr:%s ssl_err:%d %s",
+                  hctx->con->dst_addr_buf.ptr, ssl_err, buf);
+    }
 }
 
 
@@ -456,8 +579,8 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
   #endif
 
     handler_ctx *hctx = (handler_ctx *) SSL_get_app_data(ssl);
-    if (NULL == hctx->conf.pc) return SSL_TLSEXT_ERR_NOACK;/*should not happen*/
-    buffer *ssl_stapling = hctx->conf.pc->ssl_stapling;
+    if (NULL == hctx->kp) return SSL_TLSEXT_ERR_NOACK;/*should not happen*/
+    buffer *ssl_stapling = hctx->kp->ssl_stapling_der;
     if (NULL == ssl_stapling) return SSL_TLSEXT_ERR_NOACK;
     UNUSED(arg);
 
@@ -470,9 +593,9 @@ ssl_tlsext_status_cb(SSL *ssl, void *arg)
     memcpy(ocsp_resp, ssl_stapling->ptr, (uint32_t)len);
 
     if (!SSL_set_tlsext_status_ocsp_resp(ssl, ocsp_resp, len)) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set OCSP response for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
+        elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+          "failed to set OCSP response for TLS server name %s",
+          hctx->r->uri.authority.ptr);
         return SSL_TLSEXT_ERR_NOACK; /* ignore OCSP request if error occurs */
         /*return SSL_TLSEXT_ERR_ALERT_FATAL;*/
     }
@@ -543,21 +666,32 @@ mod_wolfssl_free_der_certs (buffer **certs)
 
 
 static void
+mod_wolfssl_free_plugin_ssl_ctx (plugin_ssl_ctx * const s)
+{
+    SSL_CTX_free(s->ssl_ctx);
+    if (s->kp)
+        mod_wolfssl_kp_rel(s->kp);
+    free(s);
+}
+
+
+static void
 mod_openssl_free_config (server *srv, plugin_data * const p)
 {
+  #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
     array_free(p->cafiles);
+  #endif
 
     if (NULL != p->ssl_ctxs) {
-        SSL_CTX * const ssl_ctx_global_scope = p->ssl_ctxs->ssl_ctx;
         /* free ssl_ctx from $SERVER["socket"] (if not copy of global scope) */
         for (uint32_t i = 1; i < srv->config_context->used; ++i) {
-            plugin_ssl_ctx * const s = p->ssl_ctxs + i;
-            if (s->ssl_ctx && s->ssl_ctx != ssl_ctx_global_scope)
-                SSL_CTX_free(s->ssl_ctx);
+            plugin_ssl_ctx * const s = p->ssl_ctxs[i];
+            if (s && s != p->ssl_ctxs[0])
+                mod_wolfssl_free_plugin_ssl_ctx(s);
         }
         /* free ssl_ctx from global scope */
-        if (ssl_ctx_global_scope)
-            SSL_CTX_free(ssl_ctx_global_scope);
+        if (p->ssl_ctxs[0])
+            mod_wolfssl_free_plugin_ssl_ctx(p->ssl_ctxs[0]);
         free(p->ssl_ctxs);
     }
 
@@ -570,12 +704,12 @@ mod_openssl_free_config (server *srv, plugin_data * const p)
               case 0: /* ssl.pemfile */
                 if (cpv->vtype == T_CONFIG_LOCAL) {
                     plugin_cert *pc = cpv->v.v;
-                    wolfSSL_OPENSSL_cleanse(pc->ssl_pemfile_pkey->ptr,
-                                            pc->ssl_pemfile_pkey->size);
-                    buffer_free(pc->ssl_pemfile_pkey);
-                    /*buffer_free(pc->ssl_pemfile_x509);*//*(part of chain)*/
-                    mod_wolfssl_free_der_certs(pc->ssl_pemfile_chain);
-                    buffer_free(pc->ssl_stapling);
+                    mod_wolfssl_kp *kp = pc->kp;
+                    while (kp) {
+                        mod_wolfssl_kp *o = kp;
+                        kp = kp->next;
+                        mod_wolfssl_kp_free(o);
+                    }
                     free(pc);
                 }
                 break;
@@ -584,7 +718,7 @@ mod_openssl_free_config (server *srv, plugin_data * const p)
                     plugin_cacerts *cacerts = cpv->v.v;
                     wolfSSL_sk_X509_NAME_pop_free(cacerts->names,
                                                   X509_NAME_free);
-                    wolfSSL_X509_STORE_free(cacerts->certs);
+                    wolfSSL_X509_STORE_free(cacerts->store);
                     free(cacerts);
                 }
                 break;
@@ -742,6 +876,61 @@ mod_wolfssl_load_pem_file (const char *fn, log_error_st *errh, buffer ***chain)
 
 
 static buffer *
+mod_wolfssl_load_raw_file (const char *fn, log_error_st *errh, buffer ***chain)
+{
+    /*(written after mod_wolfssl_load_pem_file(); preserve existing structs)*/
+    off_t dlen = 512*1024*1024;/*(arbitrary limit: 512 MB file; expect < 1 MB)*/
+    char *data = fdevent_load_file(fn, &dlen, errh, malloc, free);
+    if (NULL == data) return NULL;
+
+    buffer **certs = *chain = ck_malloc(2 * sizeof(buffer *));
+    certs[0] = buffer_init();
+    certs[1] = NULL;
+    if (NULL != strstr(data, "-----")) {
+        certs[0]->ptr = data;
+        certs[0]->used = (uint32_t)dlen;
+        certs[0]->size = (uint32_t)dlen+1;
+    }
+    else {
+        /*(convert to PEM for consistency)*/
+        buffer_append_string_len(certs[0], CONST_STR_LEN(PEM_BEGIN_CERT));
+        buffer_append_char(certs[0], '\n');
+        buffer_append_base64_encode(certs[0], (const unsigned char *)data,
+                                    (size_t)dlen, BASE64_STANDARD);
+        buffer_append_string_len(certs[0], CONST_STR_LEN(PEM_END_CERT));
+        buffer_append_char(certs[0], '\n');
+
+        if (dlen) ck_memzero(data, dlen);
+        free(data);
+    }
+
+  #if LIBWOLFSSL_VERSION_HEX >= 0x04002000
+    buffer *der = buffer_init();
+    char *e = certs[0]->ptr;
+    do {
+        char *b = strstr(e, PEM_BEGIN_CERT);
+        if (NULL == b) break;
+        b += sizeof(PEM_BEGIN_CERT)-1;
+        if (*b == '\r') ++b;
+        if (*b == '\n') ++b;
+        e = strstr(b, PEM_END_CERT);
+        if (NULL == e) break;
+        uint32_t len = (uint32_t)(e - b);
+        e += sizeof(PEM_END_CERT)-1;
+        if (NULL == buffer_append_base64_decode(der,b,len,BASE64_STANDARD))
+            break;
+        if (!mod_wolfssl_cert_is_active(der))
+            log_error(errh, __FILE__, __LINE__,
+              "SSL: inactive/expired X509 certificate '%s'", fn);
+    } while (0);
+    buffer_free(der);
+  #endif
+
+    return certs[0];
+}
+
+
+static buffer *
 mod_wolfssl_evp_pkey_load_pem_file (const char *fn, log_error_st *errh)
 {
     off_t dlen = 512*1024*1024;/*(arbitrary limit: 512 MB file; expect < 1 MB)*/
@@ -753,21 +942,11 @@ mod_wolfssl_evp_pkey_load_pem_file (const char *fn, log_error_st *errh)
     do {
         /*(expecting single private key in file, so first match)*/
         char *b, *e;
-        if ((b = strstr(data, PEM_BEGIN_PKEY))
-            && (e = strstr(b, PEM_END_PKEY)))
-            b += sizeof(PEM_BEGIN_PKEY)-1;
-        else if ((b = strstr(data, PEM_BEGIN_EC_PKEY))
-                 && (e = strstr(b, PEM_END_EC_PKEY)))
-            b += sizeof(PEM_BEGIN_EC_PKEY)-1;
-        else if ((b = strstr(data, PEM_BEGIN_RSA_PKEY))
-                 && (e = strstr(b, PEM_END_RSA_PKEY)))
-            b += sizeof(PEM_BEGIN_RSA_PKEY)-1;
-        else if ((b = strstr(data, PEM_BEGIN_DSA_PKEY))
-                 && (e = strstr(b, PEM_END_DSA_PKEY)))
-            b += sizeof(PEM_BEGIN_DSA_PKEY)-1;
-        else if ((b = strstr(data, PEM_BEGIN_ANY_PKEY))
-                 && (e = strstr(b, PEM_END_ANY_PKEY)))
-            b += sizeof(PEM_BEGIN_ANY_PKEY)-1;
+        if ((e = strstr(data, PEM_BEGIN))
+                 && (b = strstr(e, "PRIVATE KEY-----"))
+                 && NULL == memchr(e, '\n', (size_t)(b - e))
+                 && (e = strstr(b, PEM_END)))
+            b += sizeof("PRIVATE KEY-----")-1;
         else if (NULL == strstr(data, "-----")) {
             /* does not look like PEM, treat as DER format */
             pkey = buffer_init();
@@ -795,41 +974,11 @@ mod_wolfssl_evp_pkey_load_pem_file (const char *fn, log_error_st *errh)
         if (pkey) {
             wolfSSL_OPENSSL_cleanse(pkey->ptr, pkey->size);
             buffer_free(pkey);
+            pkey = NULL;
         }
-        return NULL;
     }
 
     return pkey;
-}
-
-
-static int
-mod_wolfssl_CTX_use_certificate_chain_file (WOLFSSL_CTX *ssl_ctx, const char *fn, log_error_st *errh)
-{
-    /* (While it should be possible to parse DERs from (buffer **)
-     *  s->pc->ssl_pemfile_chain, it is simpler to re-read file and use the
-     *  built-in wolfSSL_CTX_use_certificate_chain_buffer() interface) */
-    off_t dlen = 4*1024*1024;/*(arbitrary limit: 4 MB file; expect < 1 KB)*/
-    char *data = fdevent_load_file(fn, &dlen, errh, malloc, free);
-    if (NULL == data) return -1;
-
-    int rc = (NULL != strstr(data, "-----"))
-      ? wolfSSL_CTX_use_certificate_chain_buffer(ssl_ctx, (unsigned char *)data,
-                                                 (long)dlen)
-      : wolfSSL_CTX_use_certificate_chain_buffer_format(ssl_ctx,
-                                                        (unsigned char *)data,
-                                                        (long)dlen,
-                                                        WOLFSSL_FILETYPE_ASN1);
-
-    if (dlen) ck_memzero(data, dlen);
-    free(data);
-
-    if (rc == WOLFSSL_SUCCESS)
-        return 1;
-
-    log_error(errh, __FILE__, __LINE__,
-      "SSL: %s %s", ERR_error_string(rc, NULL), fn);
-    return 0;
 }
 
 
@@ -867,7 +1016,6 @@ mod_wolfssl_load_client_CA_file (const buffer *ssl_ca_file, log_error_st *errh)
             log_error(errh, __FILE__, __LINE__,
               "SSL: couldn't read X509 certificates from '%s'",
               ssl_ca_file->ptr);
-            if (subj) wolfSSL_X509_NAME_free(subj);
             if (ca) wolfSSL_X509_free(ca);
             wolfSSL_sk_X509_NAME_free(canames);
             mod_wolfssl_free_der_certs(certs);
@@ -924,7 +1072,6 @@ mod_wolfssl_load_cacerts (const buffer *ssl_ca_file, log_error_st *errh)
             log_error(errh, __FILE__, __LINE__,
               "SSL: couldn't read X509 certificates from '%s'",
               ssl_ca_file->ptr);
-            if (subj) wolfSSL_X509_NAME_free(subj);
             if (ca) wolfSSL_X509_free(ca);
             wolfSSL_sk_X509_NAME_free(canames);
             wolfSSL_X509_STORE_free(castore);
@@ -939,11 +1086,14 @@ mod_wolfssl_load_cacerts (const buffer *ssl_ca_file, log_error_st *errh)
 
     plugin_cacerts *cacerts = ck_malloc(sizeof(plugin_cacerts));
     cacerts->names = canames;
-    cacerts->certs = castore;
+    cacerts->store = castore;
+    cacerts->crl_file = NULL;
+    cacerts->crl_loadts = 0;
     return cacerts;
 }
 
 
+#if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
 static int
 mod_wolfssl_load_cacrls (WOLFSSL_CTX *ssl_ctx, const buffer *ssl_ca_crl_file, server *srv)
 {
@@ -966,8 +1116,7 @@ mod_wolfssl_load_cacrls (WOLFSSL_CTX *ssl_ctx, const buffer *ssl_ca_crl_file, se
     if (rc == WOLFSSL_SUCCESS)
         return 1;
 
-    log_error(srv->errh, __FILE__, __LINE__,
-      "SSL: %s %s", ERR_error_string(rc, NULL), fn);
+    elog(srv->errh, __FILE__, __LINE__, fn);
     return 0;
   #else
     UNUSED(ssl_ctx);
@@ -976,7 +1125,10 @@ mod_wolfssl_load_cacrls (WOLFSSL_CTX *ssl_ctx, const buffer *ssl_ca_crl_file, se
     return WOLFSSL_FAILURE;
   #endif
 }
+#endif
 
+
+#if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
 
 static int
 mod_wolfssl_load_verify_locn (SSL_CTX *ssl_ctx, const buffer *b, server *srv)
@@ -995,8 +1147,7 @@ mod_wolfssl_load_verify_locn (SSL_CTX *ssl_ctx, const buffer *b, server *srv)
     if (rc == WOLFSSL_SUCCESS)
         return 1;
 
-    log_error(srv->errh, __FILE__, __LINE__,
-      "SSL: %s %s", ERR_error_string(rc, NULL), fn);
+    elog(srv->errh, __FILE__, __LINE__, fn);
     return 0;
 }
 
@@ -1013,6 +1164,8 @@ mod_wolfssl_load_ca_files (SSL_CTX *ssl_ctx, plugin_data *p, server *srv)
     }
     return 1;
 }
+
+#endif
 
 
 FREE_FUNC(mod_openssl_free)
@@ -1219,7 +1372,8 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     safer_X509_NAME_oneline(X509_get_subject_name(err_cert),buf,sizeof(buf));
     log_error_st *errh = hctx->r->conf.errh;
     log_error(errh, __FILE__, __LINE__,
-      "SSL: verify error:num=%d:%s:depth=%d:subject=%s",
+      "SSL: addr:%s verify error:num=%d:%s:depth=%d:subject=%s",
+      hctx->con->dst_addr_buf.ptr,
       err, X509_verify_cert_error_string(err), depth, buf);
 
     /*
@@ -1229,7 +1383,8 @@ verify_callback(int preverify_ok, X509_STORE_CTX *ctx)
     if (!preverify_ok && (err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY ||
                           err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT)) {
         safer_X509_NAME_oneline(X509_get_issuer_name(err_cert),buf,sizeof(buf));
-        log_error(errh, __FILE__, __LINE__, "SSL: issuer=%s", buf);
+        log_error(errh, __FILE__, __LINE__,
+          "SSL: addr:%s issuer=%s", hctx->con->dst_addr_buf.ptr, buf);
     }
 
     return !hctx->conf.ssl_verifyclient_enforce;
@@ -1242,7 +1397,7 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
     plugin_cert *pc = hctx->conf.pc;
     UNUSED(arg);
 
-    if (!pc || NULL == pc->ssl_pemfile_x509 || NULL == pc->ssl_pemfile_pkey) {
+    if (!pc) {
         /* x509/pkey available <=> pemfile was set <=> pemfile got patched:
          * so this should never happen, unless you nest $SERVER["socket"] */
         log_error(hctx->r->conf.errh, __FILE__, __LINE__,
@@ -1252,25 +1407,41 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
         return 0;
     }
 
-    /* first set certificate!
-     * setting private key checks whether certificate matches it */
-    buffer *cert = pc->ssl_pemfile_x509;
-    if (1 != wolfSSL_use_certificate_ASN1(ssl, (unsigned char *)cert->ptr,
-                                          (int)buffer_clen(cert))) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set certificate for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
-        return 0;
+    /* reuse cert chain/privkey assigned to ssl_ctx where cert matches, else
+     * wolfssl repetitively base64-decodes and copies cert chain/privkey
+     * for each session since wolfssl does not provide better interfaces */
+    if (hctx->ssl_ctx_pc
+        && buffer_is_equal(hctx->ssl_ctx_pc->ssl_pemfile, pc->ssl_pemfile)) {
+        hctx->kp = mod_wolfssl_kp_acq(hctx->ssl_ctx_pc);
     }
+    else {
+        hctx->kp = mod_wolfssl_kp_acq(pc);
+        /* first set certificate!
+         * setting private key checks whether certificate matches it */
+        if (hctx->kp->ssl_pemfile_chain) {
+            buffer *c = hctx->kp->ssl_pemfile_chain[0];
+            if (!wolfSSL_use_certificate_chain_buffer(ssl,
+                                                      (unsigned char *)c->ptr,
+                                                      (long)buffer_clen(c))) {
+                elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+                  "failed to set cert chain for TLS server name %s",
+                  hctx->r->uri.authority.ptr);
+                return 0;
+            }
+        }
+        else {
+            /*(wolfSSL does not support openssl SSL_build_cert_chain())*/
+        }
 
-    buffer *pkey = pc->ssl_pemfile_pkey;
-    if (1 != wolfSSL_use_PrivateKey_buffer(ssl, (unsigned char *)pkey->ptr,
-                                           (int)buffer_clen(pkey),
-                                           WOLFSSL_FILETYPE_ASN1)) {
-        log_error(hctx->r->conf.errh, __FILE__, __LINE__,
-          "SSL: failed to set private key for TLS server name %s: %s",
-          hctx->r->uri.authority.ptr, ERR_error_string(ERR_get_error(), NULL));
-        return 0;
+        buffer *pkey = hctx->kp->ssl_pemfile_pkey;
+        if (1 != wolfSSL_use_PrivateKey_buffer(ssl, (unsigned char *)pkey->ptr,
+                                               (int)buffer_clen(pkey),
+                                               WOLFSSL_FILETYPE_ASN1)) {
+            elogf(hctx->r->conf.errh, __FILE__, __LINE__,
+              "failed to set private key for TLS server name %s",
+              hctx->r->uri.authority.ptr);
+            return 0;
+        }
     }
 
     if (hctx->conf.ssl_verifyclient) {
@@ -1280,11 +1451,20 @@ mod_openssl_cert_cb (SSL *ssl, void *arg)
               "for TLS server name %s", hctx->r->uri.authority.ptr);
             return 0;
         }
-        /* WolfSSL does not support setting per-session CA list;
+      #if LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+        wolfSSL_set1_verify_cert_store(ssl, hctx->conf.ssl_ca_file->store);
+        STACK_OF(X509_NAME) * const cert_names = hctx->conf.ssl_ca_dn_file
+          ? hctx->conf.ssl_ca_dn_file
+          : hctx->conf.ssl_ca_file->names;
+        /* future: could elide copy if same list as assigned to ssl_ctx */
+        wolfSSL_set_client_CA_list(ssl, wolfSSL_dup_CA_list(cert_names));
+      #else
+        /* WolfSSL < 5.0.0 does not support setting per-session CA list;
          * limitation is to per-CTX CA list, and is not changed after SNI */
-        int mode = SSL_VERIFY_PEER;
+      #endif
+        int mode = WOLFSSL_VERIFY_PEER;
         if (hctx->conf.ssl_verifyclient_enforce)
-            mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+            mode |= WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT;
         wolfSSL_set_verify(ssl, mode, verify_callback);
         wolfSSL_set_verify_depth(ssl, hctx->conf.ssl_verifyclient_depth + 1);
     }
@@ -1310,7 +1490,8 @@ mod_openssl_SNI (handler_ctx *hctx, const char *servername, size_t len)
     request_st * const r = hctx->r;
     if (len >= 1024) { /*(expecting < 256; TLSEXT_MAXLEN_host_name is 255)*/
         log_error(r->conf.errh, __FILE__, __LINE__,
-                  "SSL: SNI name too long %.*s", (int)len, servername);
+          "SSL: addr:%s SNI name too long (%zu) %.*s...",
+          hctx->con->dst_addr_buf.ptr, len, 1024, servername);
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
 
@@ -1332,9 +1513,15 @@ mod_openssl_SNI (handler_ctx *hctx, const char *servername, size_t len)
     /*config_cond_cache_reset_item(r, COMP_HTTP_HOST);*/
     /*buffer_clear(&r->uri.authority);*/
 
+  #if LIBWOLFSSL_VERSION_HEX >= 0x05000000 \
+   && (defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL))
+    /* defer mod_openssl_cert_cb() to cert_cb (wolfSSL_CTX_set_cert_cb()) */
+    return SSL_TLSEXT_ERR_OK;
+  #else
     return (mod_openssl_cert_cb(hctx->ssl, NULL) == 1)
       ? SSL_TLSEXT_ERR_OK
       : SSL_TLSEXT_ERR_ALERT_FATAL;
+  #endif
 }
 
 static int
@@ -1376,6 +1563,102 @@ network_ssl_servername_callback (SSL *ssl, int *al, void *srv)
 }
 
 #endif /* HAVE_TLS_EXTENSIONS */
+
+
+#ifdef HAVE_CRL /* <wolfssl/options.h> */
+#if LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+
+__attribute_noinline__
+static int
+mod_wolfssl_reload_crl_file (server *srv, plugin_cacerts *cacerts, const unix_time64_t cur_ts)
+{
+  #if 1
+    /* XXX: not thread-safe if another thread has pointer to store and is about
+     * to perform client certificate verification */
+    wolfSSL_CertManagerFreeCRL(cacerts->store->cm);
+    int rc = wolfSSL_CertManagerLoadCRLFile(cacerts->store->cm,
+                                            cacerts->crl_file,
+                                            WOLFSSL_FILETYPE_PEM);
+    if (rc) {
+        cacerts->crl_loadts = cur_ts;
+    }
+    else {
+        elog(srv->errh, __FILE__, __LINE__, cacerts->crl_file);
+    }
+    return rc;
+  #else
+    /* CRLs can be updated at any time, though expected on/before Next Update */
+    WOLFSSL_X509_STORE * const new_store = wolfSSL_X509_STORE_new();
+    if (NULL == new_store)
+        return 0;
+    WOLFSSL_X509_STORE * const store = cacerts->store;
+    int rc = 1;
+    /* duplicate WOLFSSL_X509_STORE with X509 objects and skip CRLs */
+    /* (modelled off openssl X509_STORE_get1_all_certs()) */
+    /*X509_STORE_lock(store);*//*(no-op on wolfssl)*/
+    WOLF_STACK_OF(WOLFSSL_X509_OBJECT) *objs =
+      wolfSSL_X509_STORE_get0_objects(store);
+    for (int i = 0; i < wolfSSL_sk_X509_OBJECT_num(objs) && rc; ++i) {
+        X509 *cert =
+          wolfSSL_X509_OBJECT_get0_X509(wolfSSL_sk_X509_OBJECT_value(objs, i));
+        if (cert != NULL)
+            rc = wolfSSL_X509_STORE_add_cert(new_store, cert);
+    }
+    /*X509_STORE_unlock(store);*//*(no-op on wolfssl)*/
+
+    if (rc) {
+        rc = wolfSSL_CertManagerLoadCRLFile(new_store->cm,
+                                            cacerts->crl_file,
+                                            WOLFSSL_FILETYPE_PEM);
+        if (rc) {
+            cacerts->crl_loadts = cur_ts;
+            cacerts->store = new_store;
+        }
+        else {
+            elog(srv->errh, __FILE__, __LINE__, cacerts->crl_file);
+        }
+    }
+    /* XXX: not thread-safe if another thread has pointer to store and is about
+     * to perform client certificate verification */
+    wolfSSL_X509_STORE_free(rc ? store : new_store);
+    return rc;
+  #endif
+}
+
+
+static int
+mod_openssl_refresh_crl_file (server *srv, plugin_cacerts *cacerts, const unix_time64_t cur_ts)
+{
+    struct stat st;
+    if (0 != stat(cacerts->crl_file, &st)
+        || (TIME64_CAST(st.st_mtime) <= cacerts->crl_loadts
+            && cacerts->crl_loadts != (unix_time64_t)-1))
+        return 1;
+    return mod_wolfssl_reload_crl_file(srv, cacerts, cur_ts);
+}
+
+
+static void
+mod_openssl_refresh_crl_files (server *srv, const plugin_data *p, const unix_time64_t cur_ts)
+{
+    /* future: might construct array of (plugin_cacerts *) at startup
+     *         to avoid the need to search for them here */
+    /* (init i to 0 if global context; to 1 to skip empty global context) */
+    if (NULL == p->cvlist) return;
+    for (int i = !p->cvlist[0].v.u2[1], used = p->nconfig; i < used; ++i) {
+        const config_plugin_value_t *cpv = p->cvlist + p->cvlist[i].v.u2[0];
+        for (; cpv->k_id != -1; ++cpv) {
+            if (cpv->k_id != 2) continue; /* k_id == 2 for ssl.ca-file */
+            if (cpv->vtype != T_CONFIG_LOCAL) continue;
+            plugin_cacerts *cacerts = cpv->v.v;
+            if (cacerts->crl_file)
+                mod_openssl_refresh_crl_file(srv, cacerts, cur_ts);
+        }
+    }
+}
+
+#endif /* LIBWOLFSSL_VERSION_HEX >= 0x05000000 && OPENSSL_EXTRA */
+#endif /* HAVE_CRL */
 
 
 #ifdef HAVE_OCSP
@@ -1446,14 +1729,13 @@ mod_openssl_asn1_time_to_posix (const ASN1_TIME *asn1time)
 
 
 static unix_time64_t
-mod_openssl_ocsp_next_update (plugin_cert *pc)
+mod_openssl_ocsp_next_update (buffer *der)
 {
   #if LIBWOLFSSL_VERSION_HEX < 0x05000000
-    UNUSED(pc);
+    UNUSED(der);
     (void)mod_openssl_asn1_time_to_posix(NULL);
     return -1; /*(not implemented)*/
   #else
-    buffer *der = pc->ssl_stapling;
     const unsigned char *p = (unsigned char *)der->ptr; /*(p gets modified)*/
     OCSP_RESPONSE *ocsp = d2i_OCSP_RESPONSE(NULL, &p, buffer_clen(der));
     if (NULL == ocsp) return -1;
@@ -1465,31 +1747,7 @@ mod_openssl_ocsp_next_update (plugin_cert *pc)
 
     /* XXX: should save and evaluate cert status returned by these calls */
     ASN1_TIME *nextupd = NULL;
-   #if LIBWOLFSSL_VERSION_HEX < 0x04006000
-    /* WolfSSL does not provide OCSP_resp_get0() OCSP_single_get0_status() */
-    /* (inactive code path; alternative path followed in #if above for WolfSSL)
-     * (chain not currently available in mod_openssl when used with WolfSSL)
-     * (For WolfSSL, pc->ssl_pemfile_chain might not be filled in with actual
-     *  chain, but is used to store (buffer **) of DER decoded from PEM certs
-     *  read from ssl.pemfile, which may be a single cert, pc->ssl_pemfile_x509.
-     *  The chain is not calculated or filled in if single cert, and neither are
-     *  (X509 *), though (X509 *) could be temporarily created to calculated
-     *  (OCSP_CERTID *), which additionally could be calculated once at startup)
-     */
-    OCSP_CERTID *id = (NULL != pc->ssl_pemfile_chain)
-      ? OCSP_cert_to_id(NULL, pc->ssl_pemfile_x509,
-                        sk_X509_value(pc->ssl_pemfile_chain, 0))
-      : NULL;
-    if (id == NULL) {
-        OCSP_BASICRESP_free(bs);
-        OCSP_RESPONSE_free(ocsp);
-        return -1;
-    }
-    OCSP_resp_find_status(bs, id, NULL, NULL, NULL, NULL, &nextupd);
-    OCSP_CERTID_free(id);
-   #else
     OCSP_single_get0_status(OCSP_resp_get0(bs, 0), NULL, NULL, NULL, &nextupd);
-   #endif
     unix_time64_t t = nextupd
       ? mod_openssl_asn1_time_to_posix(nextupd)
       : (time_t)-1;
@@ -1510,13 +1768,14 @@ __attribute_cold__
 static void
 mod_openssl_expire_stapling_file (server *srv, plugin_cert *pc)
 {
-    if (NULL == pc->ssl_stapling) /*(previously discarded or never loaded)*/
+    mod_wolfssl_kp * const kp = pc->kp;
+    if (NULL == kp->ssl_stapling_der) /*(previously discarded or never loaded)*/
         return;
 
     /* discard expired OCSP stapling response */
-    buffer_free(pc->ssl_stapling);
-    pc->ssl_stapling = NULL;
-    if (pc->must_staple)
+    buffer_free(kp->ssl_stapling_der);
+    kp->ssl_stapling_der = NULL;
+    if (kp->must_staple)
         log_error(srv->errh, __FILE__, __LINE__,
                   "certificate marked OCSP Must-Staple, "
                   "but OCSP response expired from ssl.stapling-file %s",
@@ -1527,21 +1786,22 @@ mod_openssl_expire_stapling_file (server *srv, plugin_cert *pc)
 static int
 mod_openssl_reload_stapling_file (server *srv, plugin_cert *pc, const unix_time64_t cur_ts)
 {
+    mod_wolfssl_kp * const kp = pc->kp;
     buffer *b = mod_openssl_load_stapling_file(pc->ssl_stapling_file->ptr,
-                                               srv->errh, pc->ssl_stapling);
+                                               srv->errh, kp->ssl_stapling_der);
     if (!b) return 0;
 
-    pc->ssl_stapling = b; /*(unchanged unless orig was NULL)*/
-    pc->ssl_stapling_loadts = cur_ts;
-    pc->ssl_stapling_nextts = mod_openssl_ocsp_next_update(pc);
-    if (pc->ssl_stapling_nextts == (time_t)-1) {
+    kp->ssl_stapling_der = b; /*(unchanged unless orig was NULL)*/
+    kp->ssl_stapling_loadts = cur_ts;
+    kp->ssl_stapling_nextts = mod_openssl_ocsp_next_update(b);
+    if (kp->ssl_stapling_nextts == (time_t)-1) {
         /* "Next Update" might not be provided by OCSP responder
          * Use 3600 sec (1 hour) in that case. */
         /* retry in 1 hour if unable to determine Next Update */
-        pc->ssl_stapling_nextts = cur_ts + 3600;
-        pc->ssl_stapling_loadts = 0;
+        kp->ssl_stapling_nextts = cur_ts + 3600;
+        kp->ssl_stapling_loadts = 0;
     }
-    else if (pc->ssl_stapling_nextts < cur_ts) {
+    else if (kp->ssl_stapling_nextts < cur_ts) {
         mod_openssl_expire_stapling_file(srv, pc);
         return 0;
     }
@@ -1553,12 +1813,13 @@ mod_openssl_reload_stapling_file (server *srv, plugin_cert *pc, const unix_time6
 static int
 mod_openssl_refresh_stapling_file (server *srv, plugin_cert *pc, const unix_time64_t cur_ts)
 {
-    if (pc->ssl_stapling && pc->ssl_stapling_nextts > cur_ts + 256)
+    mod_wolfssl_kp * const kp = pc->kp;
+    if (kp->ssl_stapling_der && kp->ssl_stapling_nextts > cur_ts + 256)
         return 1; /* skip check for refresh unless close to expire */
     struct stat st;
     if (0 != stat(pc->ssl_stapling_file->ptr, &st)
-        || TIME64_CAST(st.st_mtime) <= pc->ssl_stapling_loadts) {
-        if (pc->ssl_stapling && pc->ssl_stapling_nextts < cur_ts)
+        || TIME64_CAST(st.st_mtime) <= kp->ssl_stapling_loadts) {
+        if (kp->ssl_stapling_der && kp->ssl_stapling_nextts < cur_ts)
             mod_openssl_expire_stapling_file(srv, pc);
         return 1;
     }
@@ -1625,6 +1886,7 @@ mod_openssl_crt_must_staple (const WOLFSSL_X509 *crt)
 #endif /* HAVE_OCSP */
 
 
+__attribute_noinline__
 static plugin_cert *
 network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *privkey, const buffer *ssl_stapling_file)
 {
@@ -1632,7 +1894,7 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
 
     buffer **ssl_pemfile_chain = NULL;
     buffer *ssl_pemfile_x509 =
-      mod_wolfssl_load_pem_file(pemfile->ptr, srv->errh, &ssl_pemfile_chain);
+      mod_wolfssl_load_raw_file(pemfile->ptr, srv->errh, &ssl_pemfile_chain);
     if (NULL == ssl_pemfile_x509) {
       #if defined(__clang_analyzer__) || defined(__COVERITY__)
         mod_wolfssl_free_der_certs(ssl_pemfile_chain); /*unnecessary*/
@@ -1652,25 +1914,24 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
      * WolfSSL prior to v4.6.0, and still no-op #ifdef NO_CHECK_PRIVATE_KEY */
 
     plugin_cert *pc = ck_malloc(sizeof(plugin_cert));
-    pc->ssl_pemfile_pkey = ssl_pemfile_pkey;
-    pc->ssl_pemfile_x509 = ssl_pemfile_x509;
-    pc->ssl_pemfile_chain= ssl_pemfile_chain;
+    mod_wolfssl_kp * const kp = pc->kp = mod_wolfssl_kp_init();
+    kp->ssl_pemfile_pkey = ssl_pemfile_pkey;
+    kp->ssl_pemfile_x509 = ssl_pemfile_x509;
+    kp->ssl_pemfile_chain= ssl_pemfile_chain;
     pc->ssl_pemfile = pemfile;
     pc->ssl_privkey = privkey;
-    pc->ssl_stapling     = NULL;
     pc->ssl_stapling_file= ssl_stapling_file;
-    pc->ssl_stapling_loadts = 0;
-    pc->ssl_stapling_nextts = 0;
+    pc->pkey_ts = log_epoch_secs;
   #ifdef HAVE_OCSP
     WOLFSSL_X509 *crt =
       wolfSSL_X509_load_certificate_buffer((const unsigned char *)
                                              ssl_pemfile_x509->ptr,
                                            (int)buffer_clen(ssl_pemfile_x509),
-                                           WOLFSSL_FILETYPE_ASN1);
-    pc->must_staple = mod_openssl_crt_must_staple(crt);
+                                           WOLFSSL_FILETYPE_PEM);
+    kp->must_staple = mod_openssl_crt_must_staple(crt);
     wolfSSL_X509_free(crt);
   #else
-    pc->must_staple = 0;
+    kp->must_staple = 0;
   #endif
 
     if (pc->ssl_stapling_file) {
@@ -1684,7 +1945,7 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
           pc->ssl_stapling_file->ptr);
       #endif
     }
-    else if (pc->must_staple) {
+    else if (kp->must_staple) {
         log_error(srv->errh, __FILE__, __LINE__,
                   "certificate %s marked OCSP Must-Staple, "
                   "but ssl.stapling-file not provided", pemfile->ptr);
@@ -1709,7 +1970,6 @@ network_openssl_load_pemfile (server *srv, const buffer *pemfile, const buffer *
 static int
 mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
 {
-    buffer * const b = hctx->tmp_buf;
     const buffer * const name = &hctx->r->uri.authority;
     log_error_st * const errh = hctx->r->conf.errh;
     buffer *ssl_pemfile_x509 = NULL;
@@ -1732,6 +1992,7 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
     if (0 != http_request_host_policy(name,hctx->r->conf.http_parseopts,443))
         return rc;
   #endif
+    buffer * const b = buffer_init();
     buffer_copy_path_len2(b, BUF_PTR_LEN(hctx->conf.ssl_acme_tls_1),
                              BUF_PTR_LEN(name));
     len = buffer_clen(b);
@@ -1739,7 +2000,7 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
     do {
         buffer_append_string_len(b, CONST_STR_LEN(".crt.pem"));
         ssl_pemfile_x509 =
-          mod_wolfssl_load_pem_file(b->ptr, errh, &ssl_pemfile_chain);
+          mod_wolfssl_load_raw_file(b->ptr, errh, &ssl_pemfile_chain);
         if (NULL == ssl_pemfile_x509) {
             log_error(errh, __FILE__, __LINE__,
               "SSL: Failed to load acme-tls/1 pemfile: %s", b->ptr);
@@ -1757,22 +2018,31 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
 
       #if 0 /* redundant with below? */
         if (!X509_check_private_key(ssl_pemfile_x509, ssl_pemfile_pkey)) {
-            log_error(errh, __FILE__, __LINE__,
-               "SSL: Private key does not match acme-tls/1 "
-               "certificate public key, reason: %s %s"
-               ERR_error_string(ERR_get_error(), NULL), b->ptr);
+            elogf(errh, __FILE__, __LINE__,
+               "Private key does not match acme-tls/1 "
+               "certificate public key %s", b->ptr);
             break;
         }
       #endif
 
         /* first set certificate!
          * setting private key checks whether certificate matches it */
-        buffer *cert = ssl_pemfile_x509;
-        if (1 != wolfSSL_use_certificate_ASN1(ssl, (unsigned char *)cert->ptr,
-                                              (int)buffer_clen(cert))){
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: failed to set acme-tls/1 certificate for TLS server "
-              "name %s: %s", name->ptr, ERR_error_string(ERR_get_error(),NULL));
+        buffer *c = ssl_pemfile_chain[0];
+      #if 1
+        if (!wolfSSL_use_certificate_chain_buffer(ssl, (unsigned char *)c->ptr,
+                                                  (long)buffer_clen(c))) {
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 certificate for TLS server name %s",
+              name->ptr);
+            break;
+        }
+      #else
+        if (1 != wolfSSL_use_certificate_buffer(ssl, (unsigned char *)c->ptr,
+                                                (int)buffer_clen(c),
+                                                WOLFSSL_FILETYPE_PEM)) {
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 certificate for TLS server name %s",
+              name->ptr);
             break;
         }
 
@@ -1782,14 +2052,15 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
              * limitation is to per-CTX chain, and so chain is not provided for
              * "acme-tls/1" (might be non-issue; chain might not be present) */
         }
+      #endif
 
         buffer *pkey = ssl_pemfile_pkey;
         if (1 != wolfSSL_use_PrivateKey_buffer(ssl, (unsigned char *)pkey->ptr,
                                                (int)buffer_clen(pkey),
                                                WOLFSSL_FILETYPE_ASN1)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: failed to set acme-tls/1 private key for TLS server "
-              "name %s: %s", name->ptr, ERR_error_string(ERR_get_error(),NULL));
+            elogf(errh, __FILE__, __LINE__,
+              "failed to set acme-tls/1 private key for TLS server name %s",
+              name->ptr);
             break;
         }
 
@@ -1805,6 +2076,7 @@ mod_openssl_acme_tls_1 (SSL *ssl, handler_ctx *hctx)
     /*if (ssl_pemfile_x509) buffer_free(ssl_pemfile_x509);*//*(part of chain)*/
     mod_wolfssl_free_der_certs(ssl_pemfile_chain);
 
+    buffer_free(b);
     return rc;
 }
 
@@ -1815,13 +2087,15 @@ mod_openssl_alpn_h2_policy (handler_ctx * const hctx)
   #if 0 /* SNI omitted by client when connecting to IP instead of to name */
     if (buffer_is_blank(&hctx->r->uri.authority)) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 without SNI");
+          "SSL: addr:%s error ALPN h2 without SNI",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
   #endif
     if (wolfSSL_version(hctx->ssl) < TLS1_2_VERSION) {
         log_error(hctx->errh, __FILE__, __LINE__,
-          "SSL: error ALPN h2 requires TLSv1.2 or later");
+          "SSL: addr:%s error ALPN h2 requires TLSv1.2 or later",
+          hctx->con->dst_addr_buf.ptr);
         return -1;
     }
 
@@ -2092,8 +2366,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         s->ssl_ctx = SSL_CTX_new(SSLv23_server_method());
       #endif
         if (NULL == s->ssl_ctx) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_new");
             return -1;
         }
 
@@ -2105,9 +2378,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
          * required for client cert verification to work with sessions */
         if (0 == SSL_CTX_set_session_id_context(
                    s->ssl_ctx,(const unsigned char*)CONST_STR_LEN("lighttpd"))){
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: failed to set session context: %s",
-              ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh,__FILE__,__LINE__,"SSL_CTX_set_session_id_context");
             return -1;
         }
 
@@ -2132,8 +2403,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
             if ((SSL_OP_NO_SSLv3
                  & SSL_CTX_set_options(s->ssl_ctx, SSL_OP_NO_SSLv3))
                 != SSL_OP_NO_SSLv3) {
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_options");
                 return -1;
             }
         }
@@ -2141,8 +2411,7 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         if (s->ssl_cipher_list) {
             /* Disable support for low encryption ciphers */
             if (SSL_CTX_set_cipher_list(s->ssl_ctx,s->ssl_cipher_list->ptr)!=1){
-                log_error(srv->errh, __FILE__, __LINE__,
-                  "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+                elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
                 return -1;
             }
 
@@ -2170,12 +2439,21 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
         wolfSSL_CTX_set_tlsext_status_cb(s->ssl_ctx, ssl_tlsext_status_cb);
       #endif
 
+      #if LIBWOLFSSL_VERSION_HEX >= 0x05000000 \
+       && (defined(OPENSSL_EXTRA) || defined(OPENSSL_EXTRA_X509_SMALL))
+
+        wolfSSL_CTX_set_cert_cb(s->ssl_ctx, mod_openssl_cert_cb, NULL);
+
+      #endif
+
+      #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
         /* load all ssl.ca-files specified in the config into each SSL_CTX
-         * XXX: This might be a bit excessive, but are all trusted CAs
-         *      TODO: prefer to load on-demand in mod_openssl_cert_cb()
-         *            for openssl >= 1.0.2 */
+         * XXX: This might be a bit excessive, but are all trusted CAs */
         if (!mod_wolfssl_load_ca_files(s->ssl_ctx, p, srv))
             return -1;
+      #else
+        UNUSED(p);
+      #endif
 
         if (s->ssl_verifyclient) {
             if (NULL == s->ssl_ca_file) {
@@ -2192,49 +2470,59 @@ network_init_ssl (server *srv, plugin_config_socket *s, plugin_data *p)
           #else
             /* Before wolfssl 4.6.0, wolfSSL_dup_CA_list() is a stub function
              * which returns NULL, so DN names in cert request are not set here.
-             * (A patch has been submitted to WolfSSL add is part of 4.6.0)
+             * (A patch has been submitted to WolfSSL and is part of 4.6.0)
              * https://github.com/wolfSSL/wolfssl/pull/3098 */
             STACK_OF(X509_NAME) * const cert_names = s->ssl_ca_dn_file
               ? s->ssl_ca_dn_file
               : s->ssl_ca_file->names;
             wolfSSL_CTX_set_client_CA_list(s->ssl_ctx,
                                            wolfSSL_dup_CA_list(cert_names));
-            int mode = SSL_VERIFY_PEER;
+            int mode = WOLFSSL_VERIFY_PEER;
             if (s->ssl_verifyclient_enforce) {
-                mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
+                mode |= WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT;
             }
             wolfSSL_CTX_set_verify(s->ssl_ctx, mode, verify_callback);
             wolfSSL_CTX_set_verify_depth(s->ssl_ctx,
                                          s->ssl_verifyclient_depth + 1);
           #endif
-            if (s->ssl_ca_crl_file) {
+          #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
+            if (s->ssl_ca_crl_file && !buffer_is_blank(s->ssl_ca_crl_file)) {
                 if (!mod_wolfssl_load_cacrls(s->ssl_ctx,s->ssl_ca_crl_file,srv))
                     return -1;
             }
+          #endif
         }
 
-        if (1 != mod_wolfssl_CTX_use_certificate_chain_file(
-                   s->ssl_ctx, s->pc->ssl_pemfile->ptr, srv->errh))
+        /*(key-pair assigned to ssl_ctx in case SNI not provided by client)*/
+        /*(required for LIBWOLFSSL_VERSION_HEX < 0x05000000)*/
+        buffer *c = s->pc->kp->ssl_pemfile_chain[0];
+        int rc =
+          wolfSSL_CTX_use_certificate_chain_buffer(s->ssl_ctx,
+                                                   (unsigned char *)c->ptr,
+                                                   (long)buffer_clen(c));
+        if (rc != WOLFSSL_SUCCESS) {
+            elog(srv->errh, __FILE__, __LINE__, s->pc->ssl_pemfile->ptr);
             return -1;
+        }
 
-        buffer *k = s->pc->ssl_pemfile_pkey;
+        buffer *k = s->pc->kp->ssl_pemfile_pkey;
         if (1 != wolfSSL_CTX_use_PrivateKey_buffer(s->ssl_ctx,
                                                    (unsigned char *)k->ptr,
                                                    (int)buffer_clen(k),
                                                    WOLFSSL_FILETYPE_ASN1)) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
+            elogf(srv->errh, __FILE__, __LINE__, "%s %s",
               s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
             return -1;
         }
 
-        if (SSL_CTX_check_private_key(s->ssl_ctx) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: Private key does not match the certificate public key, "
-              "reason: %s %s %s", ERR_error_string(ERR_get_error(), NULL),
+      #ifndef NO_CHECK_PRIVATE_KEY
+        if (1 != wolfSSL_CTX_check_private_key(s->ssl_ctx)) {
+            elogf(srv->errh, __FILE__, __LINE__,
+              "Private key does not match the certificate public key %s %s",
               s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
             return -1;
         }
+      #endif
 
         SSL_CTX_set_default_read_ahead(s->ssl_ctx, s->ssl_read_ahead);
         wolfSSL_CTX_set_mode(s->ssl_ctx,
@@ -2335,13 +2623,13 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
     static const buffer default_ssl_cipher_list =
       { CONST_STR_LEN(LIGHTTPD_DEFAULT_CIPHER_LIST), 0 };
 
-    p->ssl_ctxs = ck_calloc(srv->config_context->used, sizeof(plugin_ssl_ctx));
+    p->ssl_ctxs = ck_calloc(srv->config_context->used,sizeof(plugin_ssl_ctx *));
 
     int rc = HANDLER_GO_ON;
     plugin_data_base srvplug;
     memset(&srvplug, 0, sizeof(srvplug));
     plugin_data_base * const ps = &srvplug;
-    if (!config_plugin_values_init(srv, ps, cpk, "mod_openssl"))
+    if (!config_plugin_values_init(srv, ps, cpk, "mod_wolfssl"))
         return HANDLER_ERROR;
 
     plugin_config_socket defaults;
@@ -2439,8 +2727,7 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
                         conf.ssl_ca_dn_file = cpv->v.v;
                     break;
                   case 4: /* ssl.ca-crl-file */
-                    if (!buffer_is_blank(cpv->v.b))
-                        conf.ssl_ca_crl_file = cpv->v.b;
+                    conf.ssl_ca_crl_file = cpv->v.b;
                     break;
                   case 5: /* ssl.read-ahead */
                     conf.ssl_read_ahead = (0 != cpv->v.u);
@@ -2478,7 +2765,7 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
                  *  and desiring to inherit the ssl config from global context
                  *  without having to duplicate the directives)*/
                 if (count_not_engine
-                    || (conf.ssl_enabled && NULL == p->ssl_ctxs[0].ssl_ctx)) {
+                    || (conf.ssl_enabled && NULL == p->ssl_ctxs[0])) {
                     log_error(srv->errh, __FILE__, __LINE__,
                       "ssl.pemfile has to be set in same $SERVER[\"socket\"] scope "
                       "as other ssl.* directives, unless only ssl.engine is set, "
@@ -2486,8 +2773,7 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
                     rc = HANDLER_ERROR;
                     continue;
                 }
-                plugin_ssl_ctx * const s = p->ssl_ctxs + sidx;
-                *s = *p->ssl_ctxs;/*(copy struct of ssl_ctx from global scope)*/
+                p->ssl_ctxs[sidx] = p->ssl_ctxs[0]; /*(copy global scope)*/
                 continue;
             }
             /* PEM file is required */
@@ -2501,8 +2787,11 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
 
         /*conf.ssl_ctx = NULL;*//*(filled by network_init_ssl() even on error)*/
         if (0 == network_init_ssl(srv, &conf, p)) {
-            plugin_ssl_ctx * const s = p->ssl_ctxs + sidx;
+            plugin_ssl_ctx * const s = p->ssl_ctxs[sidx] =
+              ck_calloc(1, sizeof(plugin_ssl_ctx));
             s->ssl_ctx = conf.ssl_ctx;
+            s->pc = conf.pc;
+            s->kp = mod_wolfssl_kp_acq(s->pc);
         }
         else {
             SSL_CTX_free(conf.ssl_ctx);
@@ -2510,12 +2799,20 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
         }
     }
 
-  #ifdef HAVE_SESSION_TICKET
-    if (rc == HANDLER_GO_ON && ssl_is_init)
-        mod_openssl_session_ticket_key_check(p, log_epoch_secs);
-  #endif
-
     free(srvplug.cvlist);
+
+    if (rc == HANDLER_GO_ON && ssl_is_init) {
+      #ifdef HAVE_SESSION_TICKET
+        mod_openssl_session_ticket_key_check(p, log_epoch_secs);
+      #endif
+
+      #ifdef HAVE_CRL
+      #if LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+        mod_openssl_refresh_crl_files(srv, p, log_epoch_secs);
+      #endif
+      #endif
+    }
+
     return rc;
 }
 
@@ -2523,13 +2820,13 @@ mod_openssl_set_defaults_sockets(server *srv, plugin_data *p)
 SETDEFAULTS_FUNC(mod_openssl_set_defaults)
 {
     static const config_plugin_keys_t cpk[] = {
-      { CONST_STR_LEN("ssl.pemfile"),
+      { CONST_STR_LEN("ssl.pemfile"), /* expect pos 0 for refresh certs,staple*/
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("ssl.privkey"),
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
-     ,{ CONST_STR_LEN("ssl.ca-file"),
+     ,{ CONST_STR_LEN("ssl.ca-file"), /* expect pos 2 for refresh crl */
         T_CONFIG_STRING,
         T_CONFIG_SCOPE_CONNECTION }
      ,{ CONST_STR_LEN("ssl.ca-dn-file"),
@@ -2584,8 +2881,10 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
 
     plugin_data * const p = p_d;
     p->srv = srv;
+  #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
     p->cafiles = array_init(0);
-    if (!config_plugin_values_init(srv, p, cpk, "mod_openssl"))
+  #endif
+    if (!config_plugin_values_init(srv, p, cpk, "mod_wolfssl"))
         return HANDLER_ERROR;
 
     const buffer *default_ssl_ca_crl_file = NULL;
@@ -2600,7 +2899,7 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
         const buffer *ssl_ca_file = NULL;
         const buffer *ssl_ca_dn_file = NULL;
         const buffer *ssl_ca_crl_file = NULL;
-        X509_STORE *ca_store = NULL;
+        plugin_cacerts *cacerts = NULL;
         for (; -1 != cpv->k_id; ++cpv) {
             switch (cpv->k_id) {
               case 0: /* ssl.pemfile */
@@ -2619,12 +2918,10 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
                 cpv->v.v = mod_wolfssl_load_cacerts(ssl_ca_file, srv->errh);
                 if (NULL != cpv->v.v) {
                     cpv->vtype = T_CONFIG_LOCAL;
-                    ca_store = ((plugin_cacerts *)cpv->v.v)->certs;
+                    cacerts = cpv->v.v;
                 }
                 else {
-                    log_error(srv->errh, __FILE__, __LINE__, "SSL: %s %s",
-                      ERR_error_string(ERR_get_error(), NULL),
-                      ssl_ca_file->ptr);
+                    elog(srv->errh, __FILE__, __LINE__, ssl_ca_file->ptr);
                     return HANDLER_ERROR;
                 }
                 break;
@@ -2649,9 +2946,7 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
                     cpv->vtype = T_CONFIG_LOCAL;
                 }
                 else {
-                    log_error(srv->errh, __FILE__, __LINE__, "SSL: %s %s",
-                      ERR_error_string(ERR_get_error(), NULL),
-                      ssl_ca_dn_file->ptr);
+                    elog(srv->errh, __FILE__, __LINE__, ssl_ca_dn_file->ptr);
                     return HANDLER_ERROR;
                 }
                 break;
@@ -2703,6 +2998,7 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
             }
         }
 
+      #if LIBWOLFSSL_VERSION_HEX < 0x05000000 || !defined(OPENSSL_EXTRA)
         /* p->cafiles for legacy only */
         /* load all ssl.ca-files into a single chain */
         /*(certificate load order might matter)*/
@@ -2710,9 +3006,31 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
             array_insert_value(p->cafiles, BUF_PTR_LEN(ssl_ca_dn_file));
         if (ssl_ca_file)
             array_insert_value(p->cafiles, BUF_PTR_LEN(ssl_ca_file));
-        UNUSED(ca_store);
+        UNUSED(cacerts);
         UNUSED(ssl_ca_crl_file);
         UNUSED(default_ssl_ca_crl_file);
+      #else
+        if (NULL == cacerts && ssl_ca_crl_file && i != 0) {
+            log_error(srv->errh, __FILE__, __LINE__,
+              "ssl.verifyclient.ca-crl-file (%s) ignored unless issued with "
+              "ssl.verifyclient.ca-file", ssl_ca_crl_file->ptr);
+        }
+        else if (cacerts && (ssl_ca_crl_file || default_ssl_ca_crl_file)) {
+            if (NULL == ssl_ca_crl_file)
+                ssl_ca_crl_file = default_ssl_ca_crl_file;
+            cacerts->crl_file = ssl_ca_crl_file->ptr;
+            cacerts->crl_loadts = (time_t)-1;
+          #ifdef HAVE_CRL_MONITOR
+            /* wolfSSL_CertManagerLoadCRL() can monitor CRL, but requires
+             * WolfSSL built with --enable-crl-monitor and is only portable
+             * on linux, darwin (MacOS), and freebsd.  Besides, monitor
+             * starts thread per cm->crl, so less generically scalable */
+          #endif
+        }
+        UNUSED(ssl_ca_dn_file);
+        UNUSED(ssl_ca_file);
+        UNUSED(default_ssl_ca_crl_file);
+      #endif
 
         if (pemfile) {
           #ifndef HAVE_TLS_EXTENSIONS
@@ -2756,37 +3074,44 @@ SETDEFAULTS_FUNC(mod_openssl_set_defaults)
             mod_openssl_merge_config(&p->defaults, cpv);
     }
 
+    feature_refresh_certs = config_feature_bool(srv, "ssl.refresh-certs", 0);
+    feature_refresh_crls  = config_feature_bool(srv, "ssl.refresh-crls",  0);
+
     return mod_openssl_set_defaults_sockets(srv, p);
 }
 
 
+static void
+mod_openssl_detach(handler_ctx *hctx);
+
+
 __attribute_cold__
 static int
-mod_wolfssl_write_err (SSL * const ssl, int wr, connection * const con,
-                       log_error_st * const errh)
+mod_wolfssl_write_err (handler_ctx * const restrict hctx, int wr)
 {
-    int ssl_r;
-    unsigned long err;
-
-    switch ((ssl_r = SSL_get_error(ssl, wr))) {
+    /* Note: caller calls ERR_clear_error() before SSL_write() */
+    const int ssl_err = SSL_get_error(hctx->ssl, wr);
+    switch (ssl_err) {
       case SSL_ERROR_WANT_READ:
-        con->is_readable = -1;
+        hctx->con->is_readable = -1;
         return 0; /* try again later */
       case SSL_ERROR_WANT_WRITE:
-        con->is_writable = -1;
+        hctx->con->is_writable = -1;
         return 0; /* try again later */
+      case SSL_ERROR_ZERO_RETURN:
+        /* clean shutdown on the remote side */
+        if (wr == 0) return -2;
+        __attribute_fallthrough__
       case SSL_ERROR_SYSCALL:
-        /* perhaps we have error waiting in our error-queue */
-        if (0 != (err = ERR_get_error())) {
-            do {
-                log_error(errh, __FILE__, __LINE__,
-                  "SSL: %d %d %s",ssl_r,wr,ERR_error_string(err,NULL));
-            } while((err = ERR_get_error()));
-        }
-        else if (wr == -1) {
-            /* no, but we have errno */
-            switch(errno) {
+        {
+            int errnum = errno;
+            switch(errnum) {
               case EAGAIN:
+             #ifdef EWOULDBLOCK
+             #if EWOULDBLOCK != EAGAIN
+              case EWOULDBLOCK:
+             #endif
+             #endif
               case EINTR:
              #if defined(__FreeBSD__) && defined(SF_NODISKIO)
               case EBUSY:
@@ -2794,32 +3119,35 @@ mod_wolfssl_write_err (SSL * const ssl, int wr, connection * const con,
                 return 0; /* try again later */
               case EPIPE:
               case ECONNRESET:
+               #if 0
+                if (hctx->conf.ssl_log_noise)
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, errnum);
+               #endif
+                mod_openssl_detach(hctx); /*non-recoverable; skip CLOSE_NOTIFY*/
                 return -2;
               default:
-                log_perror(errh, __FILE__, __LINE__,
-                  "SSL: %d %d", ssl_r, wr);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d wr:%d errno:%d",
+                      hctx->con->dst_addr_buf.ptr, ssl_err, wr, errnum);
                 break;
             }
         }
-        else {
-            /* neither error-queue nor errno ? */
-            log_perror(errh, __FILE__, __LINE__,
-              "SSL (error): %d %d", ssl_r, wr);
-        }
         break;
-
-      case SSL_ERROR_ZERO_RETURN:
-        /* clean shutdown on the remote side */
-        if (wr == 0) return -2;
-
-        __attribute_fallthrough__
+      #if LIBWOLFSSL_VERSION_HEX >= 0x03007001
+      case SOCKET_PEER_CLOSED_E:
+      case SOCKET_ERROR_E:
+        mod_openssl_detach(hctx); /*non-recoverable; skip CLOSE_NOTIFY*/
+        return -2;
+      #endif
       default:
-        while((err = ERR_get_error()))
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: %d %d %s", ssl_r, wr, ERR_error_string(err, NULL));
         break;
     }
 
+    elogc(hctx, __FILE__, __LINE__, ssl_err);
+    mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
     return -1;
 }
 
@@ -2848,8 +3176,6 @@ static int
 connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t max_bytes)
 {
     handler_ctx * const hctx = con->plugin_ctx[plugin_data_singleton->id];
-    SSL * const ssl = hctx->ssl;
-    log_error_st * const errh = hctx->errh;
 
     if (__builtin_expect( (0 != hctx->close_notify), 0))
         return mod_openssl_close_notify(hctx);
@@ -2861,7 +3187,8 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
           : (uint32_t)max_bytes;
         int wr;
 
-        if (0 != chunkqueue_peek_data(cq, &data, &data_len, errh, 1)) return -1;
+        if (0 != chunkqueue_peek_data(cq, &data, &data_len, hctx->errh, 1))
+            return -1;
         if (__builtin_expect( (0 == data_len), 0)) {
             if (!cq->first->file.busy)
                 chunkqueue_remove_finished_chunks(cq);
@@ -2878,16 +3205,17 @@ connection_write_cq_ssl (connection * const con, chunkqueue * const cq, off_t ma
          */
 
         ERR_clear_error();
-        wr = SSL_write(ssl, data, data_len);
+        wr = SSL_write(hctx->ssl, data, data_len);
 
         if (__builtin_expect( (hctx->renegotiations > 1), 0)) {
-            log_error(errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection");
+            log_error(hctx->errh, __FILE__, __LINE__,
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
         if (wr <= 0)
-            return mod_wolfssl_write_err(ssl, wr, con, errh);
+            return mod_wolfssl_write_err(hctx, wr);
 
         chunkqueue_mark_written(cq, wr);
 
@@ -2931,7 +3259,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
         if (hctx->renegotiations > 1) {
             log_error(hctx->errh, __FILE__, __LINE__,
-              "SSL: renegotiation initiated by client, killing connection");
+              "SSL: addr:%s renegotiation initiated by client, "
+              "killing connection", con->dst_addr_buf.ptr);
             return -1;
         }
 
@@ -2959,9 +3288,8 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
              && (hctx->conf.ssl_read_ahead || SSL_pending(hctx->ssl) > 0));
 
     if (len < 0) {
-        int oerrno = errno;
-        int rc, ssl_err;
-        switch ((rc = SSL_get_error(hctx->ssl, len))) {
+        const int ssl_err = SSL_get_error(hctx->ssl, len);
+        switch (ssl_err) {
         case SSL_ERROR_WANT_WRITE:
             con->is_writable = -1;
             __attribute_fallthrough__
@@ -2988,32 +3316,38 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
              *   errno for details).
              *
              */
-            while((ssl_err = ERR_get_error())) {
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s", rc, ERR_error_string(ssl_err, NULL));
-            }
-
-            switch(oerrno) {
+           {
+            const int errnum = errno;
+            switch(errnum) {
+            case EPIPE:
             case ECONNRESET:
                 if (!hctx->conf.ssl_log_noise) break;
                 __attribute_fallthrough__
             default:
-                /* (oerrno should be something like ECONNABORTED not 0
+                /* (errnum should be something like ECONNABORTED not 0
                  *  if client disconnected before anything was sent
                  *  (e.g. TCP connection probe), but it does not appear
                  *  that openssl provides such notification, not even
                  *  something like SSL_R_SSL_HANDSHAKE_FAILURE) */
-                if (0==oerrno && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
+                if (0==errnum && 0==cq->bytes_in && !hctx->conf.ssl_log_noise)
                     break;
 
-                errno = oerrno; /*(for log_perror())*/
-                log_perror(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %d %d", len, rc, oerrno);
+                if (0 == ERR_peek_error())
+                    log_perror(hctx->errh, __FILE__, __LINE__,
+                      "SSL: addr:%s ssl_err:%d rd:%d errno:%d",
+                      con->dst_addr_buf.ptr, ssl_err, len, errnum);
+                else
+                    elogc(hctx, __FILE__, __LINE__, ssl_err);
                 break;
             }
-
             break;
+           }
+        #if LIBWOLFSSL_VERSION_HEX >= 0x03007001
+        case SOCKET_PEER_CLOSED_E:
+        case SOCKET_ERROR_E:
+            if (!hctx->conf.ssl_log_noise) break;
+            __attribute_fallthrough__
+        #endif
         case SSL_ERROR_ZERO_RETURN:
             /* clean shutdown on the remote side */
 
@@ -3027,32 +3361,11 @@ connection_read_cq_ssl (connection * const con, chunkqueue * const cq, off_t max
 
             /*__attribute_fallthrough__*/
         default:
-            while((ssl_err = ERR_get_error())) {
-                switch (ERR_GET_REASON(ssl_err)) {
-                case SSL_R_SSL_HANDSHAKE_FAILURE:
-              #ifdef SSL_R_UNEXPECTED_EOF_WHILE_READING
-                case SSL_R_UNEXPECTED_EOF_WHILE_READING:
-              #endif
-              #ifdef SSL_R_TLSV1_ALERT_UNKNOWN_CA
-                case SSL_R_TLSV1_ALERT_UNKNOWN_CA:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN
-                case SSL_R_SSLV3_ALERT_CERTIFICATE_UNKNOWN:
-              #endif
-              #ifdef SSL_R_SSLV3_ALERT_BAD_CERTIFICATE
-                case SSL_R_SSLV3_ALERT_BAD_CERTIFICATE:
-              #endif
-                    if (!hctx->conf.ssl_log_noise) continue;
-                    break;
-                default:
-                    break;
-                }
-                /* get all errors from the error-queue */
-                log_error(hctx->errh, __FILE__, __LINE__,
-                  "SSL: %d %s", rc, ERR_error_string(ssl_err, NULL));
-            }
+            /* get all errors from the error-queue */
+            elogc(hctx, __FILE__, __LINE__, ssl_err);
             break;
         }
+        mod_openssl_detach(hctx); /* non-recoverable; skip CLOSE_NOTIFY */
         return -1;
     } else if (len == 0) {
         con->is_readable = 0;
@@ -3075,14 +3388,17 @@ CONNECTION_FUNC(mod_openssl_handle_con_accept)
     request_st * const r = &con->request;
     hctx->r = r;
     hctx->con = con;
-    hctx->tmp_buf = con->srv->tmp_buf;
     hctx->errh = r->conf.errh;
     con->plugin_ctx[p->id] = hctx;
     buffer_blank(&r->uri.authority);
 
-    plugin_ssl_ctx *s = p->ssl_ctxs + srv_sock->sidx;
-    if (NULL == s->ssl_ctx) s = p->ssl_ctxs; /*(inherit from global scope)*/
-    hctx->ssl = SSL_new(s->ssl_ctx);
+    plugin_ssl_ctx *s = p->ssl_ctxs[srv_sock->sidx]
+                      ? p->ssl_ctxs[srv_sock->sidx]
+                      : p->ssl_ctxs[0];
+    if (s) {
+        hctx->ssl_ctx_pc = s->pc;
+        hctx->ssl = SSL_new(s->ssl_ctx);
+    }
     if (NULL != hctx->ssl
         && SSL_set_app_data(hctx->ssl, hctx)
         && SSL_set_fd(hctx->ssl, con->fd)) {
@@ -3094,8 +3410,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_accept)
         return HANDLER_GO_ON;
     }
     else {
-        log_error(r->conf.errh, __FILE__, __LINE__,
-          "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+        elog(hctx->r->conf.errh, __FILE__, __LINE__, "accept");
         return HANDLER_ERROR;
     }
 }
@@ -3118,7 +3433,7 @@ CONNECTION_FUNC(mod_openssl_handle_con_shut_wr)
 {
     plugin_data *p = p_d;
     handler_ctx *hctx = con->plugin_ctx[p->id];
-    if (NULL == hctx) return HANDLER_GO_ON;
+    if (NULL == hctx || 1 == hctx->close_notify) return HANDLER_GO_ON;
 
     hctx->close_notify = -2;
     if (SSL_is_init_finished(hctx->ssl)) {
@@ -3136,16 +3451,16 @@ static int
 mod_openssl_close_notify(handler_ctx *hctx)
 {
         int ret, ssl_r;
-        unsigned long err;
-        log_error_st *errh;
 
         if (1 == hctx->close_notify) return -2;
 
         ERR_clear_error();
         switch ((ret = SSL_shutdown(hctx->ssl))) {
         case 1:
-            mod_openssl_detach(hctx);
-            return -2;
+            break;
+        #if defined(WOLFSSL_SHUTDOWN_NOT_DONE) && WOLFSSL_SHUTDOWN_NOT_DONE != 0
+        case WOLFSSL_SHUTDOWN_NOT_DONE:
+        #endif
         case 0:
             /* Drain SSL read buffers in case pending records need processing.
              * Limit to reading next record to avoid denial of service when CPU
@@ -3177,60 +3492,64 @@ mod_openssl_close_notify(handler_ctx *hctx)
             }
 
             ERR_clear_error();
-            switch ((ret = SSL_shutdown(hctx->ssl))) {
-            case 1:
-                mod_openssl_detach(hctx);
-                return -2;
-            case 0:
-                hctx->close_notify = -1;
-                return 0;
-            default:
+            ret = SSL_shutdown(hctx->ssl);
+            if (1 == ret)
                 break;
+            else if (0 == ret
+                    #if defined(WOLFSSL_SHUTDOWN_NOT_DONE) \
+                     && WOLFSSL_SHUTDOWN_NOT_DONE != 0
+                     || WOLFSSL_SHUTDOWN_NOT_DONE == ret
+                    #endif
+                    ) {
+                hctx->close_notify = -1;
+                return 0; /* try again later */
             }
 
             __attribute_fallthrough__
         default:
 
-            if (!SSL_is_init_finished(hctx->ssl)) {
-                mod_openssl_detach(hctx);
-                return -2;
-            }
+            if (!SSL_is_init_finished(hctx->ssl))
+                break;
 
             switch ((ssl_r = SSL_get_error(hctx->ssl, ret))) {
             case SSL_ERROR_WANT_WRITE:
             case SSL_ERROR_WANT_READ:
-            case SSL_ERROR_ZERO_RETURN: /*(unexpected here)*/
                 hctx->close_notify = -1;
                 return 0; /* try again later */
             case SSL_ERROR_SYSCALL:
-                if (0 == ERR_peek_error()) {
-                    switch(errno) {
+                {
+                    const int errnum = errno;
+                    switch (errnum) {
                     case 0: /*ssl bug (see lighttpd ticket #2213)*/
                     case EPIPE:
                     case ECONNRESET:
-                        mod_openssl_detach(hctx);
-                        return -2;
+                        break;
                     default:
-                        log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
-                          "SSL (error): %d %d", ssl_r, ret);
+                        if (0 == ERR_peek_error())
+                            log_perror(hctx->r->conf.errh, __FILE__, __LINE__,
+                              "SSL: addr:%s ssl_err:%d ret:%d errno:%d",
+                              hctx->con->dst_addr_buf.ptr, ssl_r, ret, errnum);
+                        else
+                            elogc(hctx, __FILE__, __LINE__, ssl_r);
                         break;
                     }
-                    break;
                 }
-                __attribute_fallthrough__
+                break;
+            #if LIBWOLFSSL_VERSION_HEX >= 0x03007001
+            case SOCKET_PEER_CLOSED_E:
+            case SOCKET_ERROR_E:
+                break;
+            #endif
             default:
-                errh = hctx->r->conf.errh;
-                while((err = ERR_get_error())) {
-                    log_error(errh, __FILE__, __LINE__,
-                      "SSL: %d %d %s", ssl_r, ret, ERR_error_string(err, NULL));
-                }
-
+                elogc(hctx, __FILE__, __LINE__, ssl_r);
                 break;
             }
+
+            break;
         }
-        ERR_clear_error();
-        hctx->close_notify = -1;
-        return ret;
+
+        mod_openssl_detach(hctx);
+        return -2;
 }
 
 
@@ -3288,7 +3607,7 @@ static void
 https_add_ssl_client_verify_err (buffer * const b, long status)
 {
     char errstr[256];
-    ERR_error_string_n(status, errstr, sizeof(errstr));
+    wolfSSL_ERR_error_string_n(status, errstr, sizeof(errstr));
     buffer_append_string(b, errstr);
 }
 
@@ -3450,6 +3769,144 @@ REQUEST_FUNC(mod_openssl_handle_request_reset)
 }
 
 
+#if LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+
+static void
+mod_wolfssl_refresh_plugin_ssl_ctx (server * const srv, plugin_ssl_ctx * const s)
+{
+    if (NULL == s->kp || NULL == s->pc || s->kp == s->pc->kp) return;
+    mod_wolfssl_kp_rel(s->kp);
+    s->kp = mod_wolfssl_kp_acq(s->pc);
+
+    buffer *c = s->kp->ssl_pemfile_chain[0];
+    int rc =
+      wolfSSL_CTX_use_certificate_chain_buffer(s->ssl_ctx,
+                                               (unsigned char *)c->ptr,
+                                               (long)buffer_clen(c));
+    if (rc != WOLFSSL_SUCCESS) {
+        elog(srv->errh, __FILE__, __LINE__, s->pc->ssl_pemfile->ptr);
+        return; /* no recovery until admin fixes input files */
+    }
+
+    buffer *k = s->kp->ssl_pemfile_pkey;
+    if (1 != wolfSSL_CTX_use_PrivateKey_buffer(s->ssl_ctx,
+                                               (unsigned char *)k->ptr,
+                                               (int)buffer_clen(k),
+                                               WOLFSSL_FILETYPE_ASN1)) {
+        elogf(srv->errh, __FILE__, __LINE__, "%s %s",
+          s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
+        return; /* no recovery until admin fixes input files */
+    }
+
+    /* cert and privkey already validated in network_openssl_load_pemfile() */
+  #if 0
+  #ifndef NO_CHECK_PRIVATE_KEY
+    if (1 != wolfSSL_CTX_check_private_key(s->ssl_ctx)) {
+        elogf(srv->errh, __FILE__, __LINE__,
+          "Private key does not match the certificate public key %s %s"
+          s->pc->ssl_pemfile->ptr, s->pc->ssl_privkey->ptr);
+        return; /* no recovery until admin fixes input files */
+    }
+  #endif
+  #endif
+}
+
+
+__attribute_cold__
+static int
+mod_wolfssl_refresh_plugin_cert_fail (server * const srv, plugin_cert * const pc)
+{
+    log_perror(srv->errh, __FILE__, __LINE__,
+               "SSL: unable to check/refresh cert key; "
+               "continuing to use already-loaded %s",
+               pc->ssl_privkey->ptr);
+    return 0;
+}
+
+
+static int
+mod_wolfssl_refresh_plugin_cert (server * const srv, plugin_cert * const pc)
+{
+    /* Check for and free updated items from prior refresh iteration and which
+     * now have refcnt 0.  Waiting for next iteration is a not-quite thread-safe
+     * but lock-free way to have extremely low probability that another thread
+     * might have a reference but was suspended between storing pointer and
+     * updating refcnt (kp_acq), and still suspended full refresh period later;
+     * highly unlikely unless thread is stopped in a debugger.  There should be
+     * single maint thread, other threads read only pc->kp head, and pc->kp head
+     * should always have refcnt >= 1, except possibly during process shutdown*/
+    /*(lighttpd is currently single-threaded)*/
+    for (mod_wolfssl_kp **kpp = &pc->kp->next; *kpp; ) {
+        mod_wolfssl_kp *kp = *kpp;
+        if (kp->refcnt)
+            kpp = &kp->next;
+        else {
+            *kpp = kp->next;
+            mod_wolfssl_kp_free(kp);
+        }
+    }
+
+    /* Note: check last modification timestamp only on privkey file, so when
+     * 'mv' updated files into place from generation location, script should
+     * update privkey last, after pem file (and OCSP stapling file) */
+    struct stat st;
+    if (0 != stat(pc->ssl_privkey->ptr, &st))
+        return mod_wolfssl_refresh_plugin_cert_fail(srv, pc);
+        /* ignore if stat() error; keep using existing crt/pk */
+    if (TIME64_CAST(st.st_mtime) <= pc->pkey_ts)
+        return 0; /* mtime match; no change */
+
+    plugin_cert *npc =
+      network_openssl_load_pemfile(srv, pc->ssl_pemfile, pc->ssl_privkey,
+                                   pc->ssl_stapling_file);
+    if (NULL == npc)
+        return mod_wolfssl_refresh_plugin_cert_fail(srv, pc);
+        /* ignore if crt/pk error; keep using existing crt/pk */
+
+    /*(future: if threaded, only one thread should update pcs)*/
+
+    mod_wolfssl_kp * const kp = pc->kp;
+    mod_wolfssl_kp * const nkp = npc->kp;
+    nkp->next = kp;
+    pc->pkey_ts = npc->pkey_ts;
+    pc->kp = nkp;
+    mod_wolfssl_kp_rel(kp);
+
+    free(npc);
+    return 1;
+}
+
+
+static void
+mod_wolfssl_refresh_certs (server *srv, const plugin_data * const p)
+{
+    if (NULL == p->cvlist) return;
+    int newpcs = 0;
+    /* (init i to 0 if global context; to 1 to skip empty global context) */
+    for (int i = !p->cvlist[0].v.u2[1], used = p->nconfig; i < used; ++i) {
+        config_plugin_value_t *cpv = p->cvlist + p->cvlist[i].v.u2[0];
+        for (; -1 != cpv->k_id; ++cpv) {
+            if (cpv->k_id != 0) continue; /* k_id == 0 for ssl.pemfile */
+            if (cpv->vtype != T_CONFIG_LOCAL) continue;
+            newpcs |= mod_wolfssl_refresh_plugin_cert(srv, cpv->v.v);
+        }
+    }
+
+    if (newpcs && NULL != p->ssl_ctxs) {
+        if (p->ssl_ctxs[0])
+            mod_wolfssl_refresh_plugin_ssl_ctx(srv, p->ssl_ctxs[0]);
+        /* refresh $SERVER["socket"] (if not copy of global scope) */
+        for (uint32_t i = 1; i < srv->config_context->used; ++i) {
+            plugin_ssl_ctx * const s = p->ssl_ctxs[i];
+            if (s && s != p->ssl_ctxs[0])
+                mod_wolfssl_refresh_plugin_ssl_ctx(srv, s);
+        }
+    }
+}
+
+#endif /* LIBWOLFSSL_VERSION_HEX >= 0x05000000 && OPENSSL_EXTRA */
+
+
 TRIGGER_FUNC(mod_openssl_handle_trigger) {
     const plugin_data * const p = p_d;
     const unix_time64_t cur_ts = log_epoch_secs;
@@ -3461,8 +3918,26 @@ TRIGGER_FUNC(mod_openssl_handle_trigger) {
     mod_openssl_session_ticket_key_check(p, cur_ts);
   #endif
 
+  #if LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+    /* enable with wolfSSL_CTX_set_cert_cb() which runs unconditionally;
+     * not enabled for wolfssl < 5.x since refcnt not incr if SNI not present */
+    /*if (!(cur_ts & 0x3ff))*/ /*(once each 1024 sec (~17 min))*/
+        if (feature_refresh_certs)
+            mod_wolfssl_refresh_certs(srv, p);
+  #else
+    UNUSED(feature_refresh_certs);
+  #endif
+
   #ifdef HAVE_OCSP
     mod_openssl_refresh_stapling_files(srv, p, cur_ts);
+  #endif
+
+  #if defined(HAVE_CRL) \
+   && LIBWOLFSSL_VERSION_HEX >= 0x05000000 && defined(OPENSSL_EXTRA)
+    if (feature_refresh_crls)
+        mod_openssl_refresh_crl_files(srv, p, cur_ts);
+  #else
+    UNUSED(feature_refresh_crls);
   #endif
 
     return HANDLER_GO_ON;
@@ -3683,8 +4158,7 @@ mod_openssl_ssl_conf_cmd (server *srv, plugin_config_socket *s)
         buffer_append_string_len(cipherstring,
                                  CONST_STR_LEN(":!aNULL:!eNULL:!EXP"));
         if (SSL_CTX_set_cipher_list(s->ssl_ctx, cipherstring->ptr) != 1) {
-            log_error(srv->errh, __FILE__, __LINE__,
-              "SSL: %s", ERR_error_string(ERR_get_error(), NULL));
+            elog(srv->errh, __FILE__, __LINE__, "SSL_CTX_set_cipher_list");
             rc = -1;
         }
 
